@@ -1,0 +1,2 @@
+FID_disc_mlp = 72
+FID_disc_conv = 68
