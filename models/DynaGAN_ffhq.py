@@ -141,10 +141,14 @@ class SG2Generator(torch.nn.Module):
         domain_labels = [None],
         alpha=1.0, beta=1.0,
         domain_is_latents=False,
+        multipliers=[1]*18,
         ):
+        if multipliers:
+            assert len(multipliers) == 18 or len(multipliers) == 1, "multipliers should either by length 18 or 1"
         return self.generator(styles, return_latents=return_latents, truncation=truncation,
                               truncation_latent=self.mean_latent, noise=noise, randomize_noise=randomize_noise,
-                              input_is_latent=input_is_latent, domain_labels=domain_labels, alpha=alpha, beta=beta, domain_is_latents=domain_is_latents)
+                              input_is_latent=input_is_latent, domain_labels=domain_labels, alpha=alpha, beta=beta, 
+                              domain_is_latents=domain_is_latents, multipliers=multipliers)
 
 class DynaGAN(torch.nn.Module):
     def __init__(self, args):

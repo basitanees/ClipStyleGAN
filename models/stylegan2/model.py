@@ -617,6 +617,8 @@ class Generator(nn.Module):
             domain_labels = [None],
             alpha=1.0, beta=1.0,
             domain_is_latents = False,
+            only_img=True,
+            multipliers=[1]*18,
     ):
             
         if not input_is_latent:
@@ -671,7 +673,7 @@ class Generator(nn.Module):
         out = self.input(latent)
 
         if start_layer == 0:
-            out = self.conv1(out, latent[:, 0], noise=noise[0], domain_style=domain_styles[0], alpha=alpha, beta=beta)  # 0th layer
+            out = self.conv1(out, latent[:, 0], noise=noise[0], domain_style=domain_styles[0]*multipliers[0], alpha=alpha, beta=beta)  # 0th layer
             skip = self.to_rgb1(out, latent[:, 1])
         if end_layer == 0:
             return out, skip
@@ -683,20 +685,22 @@ class Generator(nn.Module):
             if current_layer < start_layer:
                 pass
             elif current_layer == start_layer:
-                out = conv1(layer_in, latent[:, i], noise=noise1, domain_style=domain_styles[0], alpha=alpha, beta=beta)
-                out = conv2(out, latent[:, i + 1], noise=noise2, domain_style=domain_styles[0], alpha=alpha, beta=beta)
+                out = conv1(layer_in, latent[:, i], noise=noise1, domain_style=domain_styles[0]*multipliers[i], alpha=alpha, beta=beta)
+                out = conv2(out, latent[:, i + 1], noise=noise2, domain_style=domain_styles[0]*multipliers[i+1], alpha=alpha, beta=beta)
                 skip = to_rgb(out, latent[:, i + 2], skip)
             elif current_layer > end_layer:
                 return out, skip
             else:
-                out = conv1(out, latent[:, i], noise=noise1, domain_style=domain_styles[0], alpha=alpha, beta=beta)
-                out = conv2(out, latent[:, i + 1], noise=noise2, domain_style=domain_styles[0], alpha=alpha, beta=beta)
+                out = conv1(out, latent[:, i], noise=noise1, domain_style=domain_styles[0]*multipliers[i], alpha=alpha, beta=beta)
+                out = conv2(out, latent[:, i + 1], noise=noise2, domain_style=domain_styles[0]*multipliers[i+1], alpha=alpha, beta=beta)
                 skip = to_rgb(out, latent[:, i + 2], skip)
             current_layer += 1
             i += 2
 
         image = skip
-
+        if only_img:
+            return [image]
+        
         if return_latents:
             return image, latent
 
