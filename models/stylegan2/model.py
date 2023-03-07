@@ -12,6 +12,7 @@ from models.stylegan2.op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d
 import torchvision
 toPIL = torchvision.transforms.ToPILImage()
 import numpy as np
+from torch.nn import Sigmoid
 
 class PixelNorm(nn.Module):
     def __init__(self):
@@ -191,7 +192,8 @@ class HyperNet(nn.Module):
         kernel_size,
         no_scaling=False, 
         no_residual=False,
-        device = "cuda"
+        device = "cuda",
+        scaled = True
     ):
         super().__init__()
         self.style_dim = style_dim
@@ -201,6 +203,11 @@ class HyperNet(nn.Module):
         
         self.no_scaling = no_scaling
         self.no_residual= no_residual
+        
+        self.scaled = scaled
+        if self.scaled:
+            self.dom_scale = EqualLinear(self.style_dim, 1, bias_init=0).to(device)
+            self.sigmoid = Sigmoid()
         
         if not no_residual: 
             self.out_channel_estimator = EqualLinear(self.style_dim, self.out_channel, bias_init=1).to(device)
@@ -219,6 +226,9 @@ class HyperNet(nn.Module):
     def forward(self, domain_style):
         batch = len(domain_style)
         
+        if self.scaled:
+            scale = self.sigmoid(self.dom_scale(domain_style))
+            domain_style = domain_style * scale
         
         if not self.no_residual:
             res_out_channel = self.out_channel_estimator(domain_style)
@@ -355,9 +365,9 @@ class ModulatedConv2d(nn.Module):
 
         return out
 
-    def create_domain_modulation(self, no_scaling=False, no_residual=False):
+    def create_domain_modulation(self, no_scaling=False, no_residual=False, scaled=True):
         
-        self.hypernet = HyperNet(self.style_dim, self.out_channel, self.in_channel, self.kernel_size, no_scaling=no_scaling, no_residual=no_residual)
+        self.hypernet = HyperNet(self.style_dim, self.out_channel, self.in_channel, self.kernel_size, no_scaling=no_scaling, no_residual=no_residual, scaled=scaled)
                
             
 class NoiseInjection(nn.Module):
@@ -423,8 +433,8 @@ class StyledConv(nn.Module):
 
         return out
 
-    def create_domain_modulation(self, no_scaling=False, no_residual=False):
-        self.conv.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual)
+    def create_domain_modulation(self, no_scaling=False, no_residual=False, scaled=True):
+        self.conv.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, scaled=scaled)
 
 class ToRGB(nn.Module):
     def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=[1, 3, 3, 1]):
@@ -575,11 +585,11 @@ class Generator(nn.Module):
     def get_latent(self, input):
         return self.style(input)
 
-    def create_domain_modulation(self, no_scaling=False, no_residual=False, embed2embed=False):
+    def create_domain_modulation(self, no_scaling=False, no_residual=False, scaled=True, embed2embed=False):
         
-        self.conv1.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual)
+        self.conv1.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, scaled=scaled)
         for conv in self.convs:
-            conv.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual)
+            conv.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, scaled=scaled)
         if not embed2embed:
             layers = [ EqualLinear(
                         self.c_dim, self.style_dim
@@ -866,4 +876,3 @@ class Discriminator(nn.Module):
         out = self.final_linear(out)
 
         return out
-
