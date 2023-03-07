@@ -4,9 +4,10 @@ import os
 import torch
 import numpy as np
 from tqdm.auto import tqdm
-from models.stylegan2.model import Generator
-from models.e4e.e4e_models.encoders.psp_encoders import Encoder4Editing
-from models.e4e.e4e_models.psp import get_keys
+from models.stylegan2.model_old import Generator
+# from models.stylegan2.model_old import Generator
+# from models.e4e.e4e_models.encoders.psp_encoders import Encoder4Editing
+# from models.e4e.e4e_models.psp import get_keys
 from losses.clip_loss import CLIPLoss
 from losses.id_loss import IDLoss
 from losses import lpips
@@ -15,7 +16,7 @@ import torchvision
 from utils.bicubic import BicubicDownSample
 from utils.model_utils import google_drive_paths, download_weight
 import dlib
-from utils.shape_predictor import align_face
+# from utils.shape_predictor import align_face
 from models.II2S import II2S
 from pathlib import Path
 from datasets.target_dataset import TargetDataset
@@ -28,7 +29,7 @@ def requires_grad(model, flag=True):
 
 
 class SG2Generator(torch.nn.Module):
-    def __init__(self, checkpoint_path, latent_size=512, map_layers=8, img_size=256, channel_multiplier=2, device='cuda:0', is_dynagan=False, c_dim=0, no_scaling=False, no_residual=False, embed_mlp=False):
+    def __init__(self, checkpoint_path, latent_size=512, map_layers=8, img_size=256, channel_multiplier=2, device='cuda:0', is_dynagan=False, c_dim=0, no_scaling=False, no_residual=False, embed_mlp=False, embed_scaling=True):
         super(SG2Generator, self).__init__()
 
         self.latent_size = latent_size
@@ -56,12 +57,12 @@ class SG2Generator(torch.nn.Module):
             ).to(device)
             self.generator.load_state_dict(checkpoint["g_ema"], strict=True)
             if is_dynagan:
-                self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp)
+                self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp, scaled=embed_scaling)
         else:
             self.generator = Generator(
                 img_size, latent_size, map_layers, channel_multiplier=channel_multiplier, multi_domain=is_dynagan, c_dim=c_dim
             ).to(device)
-            self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp)
+            self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp, scaled=embed_scaling)
             self.generator.load_state_dict(checkpoint["g_ema"], strict=True)
             
         self.is_dynagan = True
@@ -150,6 +151,24 @@ class SG2Generator(torch.nn.Module):
                               input_is_latent=input_is_latent, domain_labels=domain_labels, alpha=alpha, beta=beta, 
                               domain_is_latents=domain_is_latents, multipliers=multipliers)
 
+    # def forward_clip(self,
+    #     styles,
+    #     clip_model,
+    #     return_latents=False,
+    #     truncation=1,
+    #     input_is_latent=False,
+    #     noise=None,
+    #     randomize_noise=True,
+    #     domain_labels = [None],
+    #     alpha=1.0, beta=1.0,
+    #     domain_is_latents=False,
+    #     ):
+    #     out = self.generator(styles, return_latents=return_latents, truncation=truncation,
+    #                           truncation_latent=self.mean_latent, noise=noise, randomize_noise=randomize_noise,
+    #                           input_is_latent=input_is_latent, domain_labels=domain_labels, alpha=alpha, beta=beta, domain_is_latents=domain_is_latents)
+
+
+
 class DynaGAN(torch.nn.Module):
     def __init__(self, args):
         super(DynaGAN, self).__init__()
@@ -177,16 +196,13 @@ class DynaGAN(torch.nn.Module):
         self.generator_trainable.train()
         self.generator_trainable.mean_latent = self.generator_frozen.mean_latent
 
-        if self.args.e4e_checkpoint_path:
-            print('Loading e4e over the pSp framework from checkpoint: {}'.format(self.args.e4e_checkpoint_path))
-            self.encoder = Encoder4Editing(50, 'ir_se', self.args).to(self.device)
-            ckpt = torch.load(self.args.e4e_checkpoint_path, map_location='cpu')
-            self.encoder.load_state_dict(get_keys(ckpt, 'encoder'), strict=True)
-            del ckpt
-        else:
-            print("not loading e4e")
+        # self.encoder = Encoder4Editing(50, 'ir_se', self.args).to(self.device)
+        # print('Loading e4e over the pSp framework from checkpoint: {}'.format(self.args.e4e_checkpoint_path))
+        # ckpt = torch.load(self.args.e4e_checkpoint_path, map_location='cpu')
+        # self.encoder.load_state_dict(get_keys(ckpt, 'encoder'), strict=True)
+        # del ckpt
         
-        # Set up losses
+        # Set up losses 
         print("Setting up CLIP loss")
         self.clip_loss_models = {model_name: CLIPLoss(self.device,
                                                       lambda_direction=args.lambda_direction,
@@ -297,14 +313,15 @@ class DynaGAN(torch.nn.Module):
             w_styles = self.generator_frozen.style(styles)
             frozen_img = self.generator_frozen(w_styles, input_is_latent=True, truncation=1,
                                                randomize_noise=randomize_noise)[0]
+            # w_styles2 = torch.roll(w_styles[0],1,dims=0)
+            # old_img2 = torch.roll(frozen_img,1,dims=0)
             # domain_idx = torch.argmax(domain_labels[0], dim=1).tolist()
             # ZP_target_latent, new_img, ZP_img_tensor_256, ZP_img_clip_embed = self.dataset[domain_idx]
             new_img, ZP_img_tensor_256 = target_img_H, target_img_L
             ZP_img_clip_embed = self.clip_loss_models["ViT-B/16"].encode_images(new_img).to(torch.float32)
             new_img, ZP_img_tensor_256, ZP_img_clip_embed = new_img.cuda(), ZP_img_tensor_256.cuda(), ZP_img_clip_embed.cuda()
-            ZP_target_latent = self.mean_latent_all.repeat(self.args.batch,1,1)#(self.encoder(ZP_img_tensor_256) * 0.05) + self.mean_latent * 0.95 #self.encoder(ZP_img_tensor_256)
-            old_img = self.generator_frozen([ZP_target_latent], input_is_latent=True, truncation=1,
-                                        randomize_noise=randomize_noise)[0]
+            ZP_target_latent = self.mean_latent_all.repeat(self.args.batch,1,1)#(self.encoder(ZP_img_tensor_256) * 0.05) + self.mean_latent * 0.95 #self.encoder(ZP_img_tensor_256) #w_styles2 # 
+            old_img = self.generator_frozen([ZP_target_latent], input_is_latent=True, truncation=1,randomize_noise=randomize_noise)[0]
             # domain_labels_c = domain_labels
             ##############################################
             domain_labels_c = [torch.eye(self.args.batch)]###########################
@@ -333,27 +350,43 @@ class DynaGAN(torch.nn.Module):
             # pass
 
         else:
-            
+            ###########
+            with torch.no_grad():
+                old_img_embed = self.clip_loss_models["ViT-B/16"].encode_images(old_img).to(torch.float32) ###
+            domain_labels = [ZP_img_clip_embed-old_img_embed] # ZP_img_clip_embed is target embedding
+            ###########
             rec_img = self.generator_trainable([ZP_target_latent], input_is_latent=True, truncation=1, domain_labels = domain_labels,
                                                 randomize_noise=randomize_noise,domain_is_latents=domain_is_latents)[0]
 
+            ###########
+            with torch.no_grad():
+                frozen_img_clip_embed = self.clip_loss_models["ViT-B/16"].encode_images(frozen_img).to(torch.float32)
+            domain_labels = [ZP_img_clip_embed-frozen_img_clip_embed] # ZP_img_clip_embed is target embedding
+            ###########
             trainable_img = self.generator_trainable(w_styles, input_is_latent=True, truncation=1, domain_labels = domain_labels,
                                                      randomize_noise=randomize_noise,domain_is_latents=domain_is_latents)[0]
+            
+            loss_dict = {}
             clip_across_loss = torch.sum(torch.stack([self.clip_model_weights[model_name] * self.clip_loss_models[
                 model_name](frozen_img, old_img, trainable_img, new_img, True) for model_name in
                                                       self.clip_model_weights.keys()]))
+            loss_dict["clip_across_loss"] = clip_across_loss.item()
 
             clip_within_loss = torch.sum(
                 torch.stack([self.clip_model_weights[model_name] * self.clip_loss_models[model_name](
-                    frozen_img, old_img, trainable_img, new_img, False) for model_name in
+                    frozen_img, old_img, trainable_img, rec_img, False) for model_name in # new_img instead of rec_img
                              self.clip_model_weights.keys()]))
+            loss_dict["clip_within_loss"] = clip_within_loss.item()
 
             ref_clip_loss = torch.sum(torch.stack(
                 [self.clip_model_weights[model_name] * self.clip_loss_models[model_name].rec_loss(rec_img, new_img) for
                  model_name in self.clip_model_weights.keys()]))
+            loss_dict["ref_clip_loss"] = ref_clip_loss.item()
 
             l2_loss = self.mse(self.D_VGG(rec_img), ZP_img_tensor_256)
+            loss_dict["l2_loss"] = l2_loss.item()
             lpips_loss = self.percept(self.D_VGG(rec_img), ZP_img_tensor_256).mean()
+            loss_dict["lpips_loss"] = lpips_loss.item()
 
             
             if self.args.lambda_contrast > 0.:
@@ -361,17 +394,20 @@ class DynaGAN(torch.nn.Module):
                     [self.clip_model_weights[model_name] * self.clip_loss_models[model_name].contrastive_adaptation_loss(trainable_img, ZP_img_tensor_256.cuda(), domain_labels_c) for
                     model_name in self.clip_model_weights.keys()]))
                 # contrastive_loss = 0.
+                loss_dict["contrastive_loss"] = contrastive_loss.item()
             else:
                 contrastive_loss = 0.
             
             if self.args.lambda_id > 0.:
                 id_loss = self.id_loss(frozen_img, trainable_img)[0]
+                loss_dict["id_loss"] = id_loss.item()
             else:
                 id_loss = 0.
+            
                 
             loss = self.args.clip_across_lambda * clip_across_loss + self.args.ref_clip_lambda * ref_clip_loss + \
                    self.args.lpips_lambda * lpips_loss + self.args.l2_lambda * l2_loss + self.args.clip_within_lambda * clip_within_loss + \
                        self.args.lambda_contrast * contrastive_loss + self.args.lambda_id * id_loss
 
-            return [trainable_img, None, None, None], loss
+            return [trainable_img, None, None, loss_dict], loss
 
