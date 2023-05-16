@@ -57,12 +57,12 @@ class SG2Generator(torch.nn.Module):
             ).to(device)
             self.generator.load_state_dict(checkpoint["g_ema"], strict=True)
             if is_dynagan:
-                self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp, scaled=embed_scaling)
+                self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp)
         else:
             self.generator = Generator(
                 img_size, latent_size, map_layers, channel_multiplier=channel_multiplier, multi_domain=is_dynagan, c_dim=c_dim
             ).to(device)
-            self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp, scaled=embed_scaling)
+            self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp)
             self.generator.load_state_dict(checkpoint["g_ema"], strict=True)
             
         self.is_dynagan = True
