@@ -4,7 +4,7 @@ import os
 import torch
 import numpy as np
 from tqdm.auto import tqdm
-from models.stylegan2.model import Generator
+from models.stylegan2.model_3 import Generator
 # from models.stylegan2.model_old import Generator
 # from models.e4e.e4e_models.encoders.psp_encoders import Encoder4Editing
 # from models.e4e.e4e_models.psp import get_keys
@@ -15,13 +15,12 @@ import PIL
 import torchvision
 from utils.bicubic import BicubicDownSample
 from utils.model_utils import google_drive_paths, download_weight
-import dlib
 # from utils.shape_predictor import align_face
-from models.II2S import II2S
-from pathlib import Path
-from datasets.target_dataset import TargetDataset
+# from models.II2S import II2S
+# from datasets.target_dataset import TargetDataset
 toPIL = torchvision.transforms.ToPILImage()
 import time
+import math
 
 def requires_grad(model, flag=True):
     for p in model.parameters():
@@ -29,12 +28,14 @@ def requires_grad(model, flag=True):
 
 
 class SG2Generator(torch.nn.Module):
-    def __init__(self, checkpoint_path, latent_size=512, map_layers=8, img_size=256, channel_multiplier=2, device='cuda:0', is_dynagan=False, c_dim=0, no_scaling=False, no_residual=False, embed_mlp=False, embed_scaling=True):
+    def __init__(self, checkpoint_path, latent_size=512, map_layers=8, img_size=256, channel_multiplier=2, device='cuda:0', is_dynagan=False, c_dim=0, no_scaling=False, no_residual=False, embed_mlp=False, embed_scaling=None):
         super(SG2Generator, self).__init__()
 
         self.latent_size = latent_size
         self.map_layers  = map_layers
         self.img_size = img_size
+        self.log_size = int(math.log(img_size, 2))
+        self.num_layers = (self.log_size - 2) * 2 + 1
         self.device = device
         self.c_dim = c_dim
         
@@ -57,12 +58,12 @@ class SG2Generator(torch.nn.Module):
             ).to(device)
             self.generator.load_state_dict(checkpoint["g_ema"], strict=True)
             if is_dynagan:
-                self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp)
+                self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp, scaled=embed_scaling)
         else:
             self.generator = Generator(
                 img_size, latent_size, map_layers, channel_multiplier=channel_multiplier, multi_domain=is_dynagan, c_dim=c_dim
             ).to(device)
-            self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp)
+            self.generator.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, embed2embed=embed_mlp, scaled=embed_scaling)
             self.generator.load_state_dict(checkpoint["g_ema"], strict=True)
             
         self.is_dynagan = True
@@ -71,7 +72,7 @@ class SG2Generator(torch.nn.Module):
         return list(self.generator.children())
 
     def get_training_layers(self, phase):
-
+#[conv.conv.residual_multiplier for conv in self.generator.convs] + 
         if self.is_dynagan:
             layers = [conv.conv.hypernet for conv in self.generator.convs] + [self.generator.conv1.conv.hypernet] + [self.generator.embedding]
             return layers
@@ -145,7 +146,7 @@ class SG2Generator(torch.nn.Module):
         multipliers=[1]*18,
         ):
         if multipliers:
-            assert len(multipliers) == 18 or len(multipliers) == 1, "multipliers should either by length 18 or 1"
+            assert len(multipliers) == self.num_layers or len(multipliers) == 1, "multipliers should either by length 18 or 1"
         return self.generator(styles, return_latents=return_latents, truncation=truncation,
                               truncation_latent=self.mean_latent, noise=noise, randomize_noise=randomize_noise,
                               input_is_latent=input_is_latent, domain_labels=domain_labels, alpha=alpha, beta=beta, 
@@ -185,11 +186,15 @@ class DynaGAN(torch.nn.Module):
         self.mean_latent = self.generator_frozen.mean_latent
         self.mean_latent_all = self.mean_latent.repeat(1, 18, 1)
 
+        self.log_size = int(math.log(args.stylegan_size, 2))
+        self.num_layers = (self.log_size - 2) * 2 + 1
+        
+        self.mean_latent_all = self.mean_latent.repeat(1, self.num_layers, 1)
         ################
         embed_mlp = False#############
         ################
         # Set up trainable (target) generator
-        self.generator_trainable = SG2Generator(args.train_gen_ckpt, img_size=args.size, c_dim=args.c_dim, no_scaling=args.no_scaling, no_residual=args.no_residual, is_dynagan=True, embed_mlp=embed_mlp).to(self.device)
+        self.generator_trainable = SG2Generator(args.train_gen_ckpt, img_size=args.size, c_dim=args.c_dim, no_scaling=args.no_scaling, no_residual=args.no_residual, is_dynagan=True, embed_mlp=embed_mlp, embed_scaling=args.embed_scaling).to(self.device)
         self.generator_trainable.freeze_layers()
         self.generator_trainable.unfreeze_layers(self.generator_trainable.get_training_layers(args.phase))
 
@@ -202,7 +207,7 @@ class DynaGAN(torch.nn.Module):
         # self.encoder.load_state_dict(get_keys(ckpt, 'encoder'), strict=True)
         # del ckpt
         
-        # Set up losses 
+        # Set up losses
         print("Setting up CLIP loss")
         self.clip_loss_models = {model_name: CLIPLoss(self.device,
                                                       lambda_direction=args.lambda_direction,
@@ -230,70 +235,70 @@ class DynaGAN(torch.nn.Module):
         
         self.n_latent = self.generator_frozen.generator.n_latent
 
-    def embed_style_img(self, style_img_dir):
-        if self.args.human_face:
-            from options.face_embed_options import II2S_s_opts
-        else:
-            from options.cat_embed_options import II2S_s_opts
+    # def embed_style_img(self, style_img_dir):
+    #     if self.args.human_face:
+    #         from options.face_embed_options import II2S_s_opts
+    #     else:
+    #         from options.cat_embed_options import II2S_s_opts
 
-        ZP_input_imgs = []
-        ZP_input_imgs_256 = []
-        ZP_imgs_tensor = []
-        ZP_imgs_tensor_256 = []
-        ZP_imgs_clip_embed = []
+    #     ZP_input_imgs = []
+    #     ZP_input_imgs_256 = []
+    #     ZP_imgs_tensor = []
+    #     ZP_imgs_tensor_256 = []
+    #     ZP_imgs_clip_embed = []
         
         
         
         
-        for style_img in style_img_dir:
+    #     for style_img in style_img_dir:
 
-            ZP_input_img = PIL.Image.open(style_img).convert('RGB')
-            ZP_input_img_1024 = ZP_input_img#.resize((1024, 1024), PIL.Image.BICUBIC)
-            ZP_input_imgs.append(ZP_input_img_1024)
+    #         ZP_input_img = PIL.Image.open(style_img).convert('RGB')
+    #         ZP_input_img_1024 = ZP_input_img#.resize((1024, 1024), PIL.Image.BICUBIC)
+    #         ZP_input_imgs.append(ZP_input_img_1024)
             
-            ZP_input_img_256 = ZP_input_img.resize((256, 256), PIL.Image.LANCZOS)
-            ZP_input_imgs_256.append(ZP_input_img_256)
+    #         ZP_input_img_256 = ZP_input_img.resize((256, 256), PIL.Image.LANCZOS)
+    #         ZP_input_imgs_256.append(ZP_input_img_256)
             
-            ZP_img_tensor = 2.0 * torchvision.transforms.ToTensor()(ZP_input_img_1024).unsqueeze(0).cuda() - 1.0
-            ZP_imgs_tensor.append(ZP_img_tensor)
+    #         ZP_img_tensor = 2.0 * torchvision.transforms.ToTensor()(ZP_input_img_1024).unsqueeze(0).cuda() - 1.0
+    #         ZP_imgs_tensor.append(ZP_img_tensor)
             
-            ZP_img_clip_embed = self.clip_loss_models["ViT-B/16"].encode_images(ZP_img_tensor).to(torch.float32)
-            ZP_imgs_clip_embed.append(ZP_img_clip_embed)
+    #         ZP_img_clip_embed = self.clip_loss_models["ViT-B/16"].encode_images(ZP_img_tensor).to(torch.float32)
+    #         ZP_imgs_clip_embed.append(ZP_img_clip_embed)
             
-            ZP_img_tensor_256 = 2.0 * torchvision.transforms.ToTensor()(ZP_input_img_256).unsqueeze(0).cuda() - 1.0
-            ZP_imgs_tensor_256.append(ZP_img_tensor_256)
+    #         ZP_img_tensor_256 = 2.0 * torchvision.transforms.ToTensor()(ZP_input_img_256).unsqueeze(0).cuda() - 1.0
+    #         ZP_imgs_tensor_256.append(ZP_img_tensor_256)
                 
             
-        self.ZP_img_tensor = torch.cat(ZP_imgs_tensor).detach().cpu()
-        self.ZP_img_clip_embed = torch.cat(ZP_imgs_clip_embed).detach().cpu()
-        self.ZP_img_tensor_256 = torch.cat(ZP_imgs_tensor_256).detach().cpu()
+    #     self.ZP_img_tensor = torch.cat(ZP_imgs_tensor).detach().cpu()
+    #     self.ZP_img_clip_embed = torch.cat(ZP_imgs_clip_embed).detach().cpu()
+    #     self.ZP_img_tensor_256 = torch.cat(ZP_imgs_tensor_256).detach().cpu()
         
         
         
-        if not os.path.exists(II2S_s_opts.ckpt):
-            download_weight(II2S_s_opts.ckpt)
+    #     if not os.path.exists(II2S_s_opts.ckpt):
+    #         download_weight(II2S_s_opts.ckpt)
         
-        load_inverted_latents = True
-        if load_inverted_latents: # load_inverted_latents
-            latents = torch.from_numpy(np.load("/kuacc/users/aanees20/DynaGAN/output0/inverted_latents.npy")).type(torch.FloatTensor)
-            # latents = torch.from_numpy(np.load(os.path.join(self.args.output_dir, "inverted_latents.npy"))).type(torch.FloatTensor)
-        else:
-            ii2s = II2S(II2S_s_opts)
-            start_inversion_time = time.time()
-            latents = ii2s.invert_images(image_path=style_img_dir, output_dir=None,
-                                        return_latents=True, align_input=False, save_output=False)[0]
-            end_inversion_time = time.time()
-            print(f"inversion time: {end_inversion_time - start_inversion_time}s")
-            latents = latents.detach().clone().cpu()
-            np.save(os.path.join(self.args.output_dir, "inverted_latents.npy"), latents.cpu().numpy())
-            ii2s = ii2s.cpu()
-            del ii2s
-            torch.cuda.empty_cache()
+    #     load_inverted_latents = True
+    #     if load_inverted_latents: # load_inverted_latents
+    #         latents = torch.from_numpy(np.load("/kuacc/users/aanees20/DynaGAN/output0/inverted_latents.npy")).type(torch.FloatTensor)
+    #         # latents = torch.from_numpy(np.load(os.path.join(self.args.output_dir, "inverted_latents.npy"))).type(torch.FloatTensor)
+    #     else:
+    #         ii2s = II2S(II2S_s_opts)
+    #         start_inversion_time = time.time()
+    #         latents = ii2s.invert_images(image_path=style_img_dir, output_dir=None,
+    #                                     return_latents=True, align_input=False, save_output=False)[0]
+    #         end_inversion_time = time.time()
+    #         print(f"inversion time: {end_inversion_time - start_inversion_time}s")
+    #         latents = latents.detach().clone().cpu()
+    #         np.save(os.path.join(self.args.output_dir, "inverted_latents.npy"), latents.cpu().numpy())
+    #         ii2s = ii2s.cpu()
+    #         del ii2s
+    #         torch.cuda.empty_cache()
             
-        self.ZP_target_latent = latents
-        self.dataset = TargetDataset(ZP_target_latent=latents, ZP_img_tensor=self.ZP_img_tensor, ZP_img_tensor_256=self.ZP_img_tensor_256, ZP_img_clip_tensor=self.ZP_img_clip_embed)
+    #     self.ZP_target_latent = latents
+    #     self.dataset = TargetDataset(ZP_target_latent=latents, ZP_img_tensor=self.ZP_img_tensor, ZP_img_tensor_256=self.ZP_img_tensor_256, ZP_img_clip_tensor=self.ZP_img_clip_embed)
 
-        return self.ZP_target_latent
+    #     return self.ZP_target_latent
 
     def forward(
             self,
@@ -353,17 +358,17 @@ class DynaGAN(torch.nn.Module):
             ###########
             with torch.no_grad():
                 old_img_embed = self.clip_loss_models["ViT-B/16"].encode_images(old_img).to(torch.float32) ###
-            domain_labels = [ZP_img_clip_embed-old_img_embed] # ZP_img_clip_embed is target embedding
+            domain_labels1 = [ZP_img_clip_embed-old_img_embed] # ZP_img_clip_embed is target embedding
             ###########
-            rec_img = self.generator_trainable([ZP_target_latent], input_is_latent=True, truncation=1, domain_labels = domain_labels,
+            rec_img = self.generator_trainable([ZP_target_latent], input_is_latent=True, truncation=1, domain_labels = domain_labels1,
                                                 randomize_noise=randomize_noise,domain_is_latents=domain_is_latents)[0]
 
             ###########
             with torch.no_grad():
                 frozen_img_clip_embed = self.clip_loss_models["ViT-B/16"].encode_images(frozen_img).to(torch.float32)
-            domain_labels = [ZP_img_clip_embed-frozen_img_clip_embed] # ZP_img_clip_embed is target embedding
+            domain_labels2 = [ZP_img_clip_embed-frozen_img_clip_embed] # ZP_img_clip_embed is target embedding
             ###########
-            trainable_img = self.generator_trainable(w_styles, input_is_latent=True, truncation=1, domain_labels = domain_labels,
+            trainable_img = self.generator_trainable(w_styles, input_is_latent=True, truncation=1, domain_labels = domain_labels2,
                                                      randomize_noise=randomize_noise,domain_is_latents=domain_is_latents)[0]
             
             loss_dict = {}
