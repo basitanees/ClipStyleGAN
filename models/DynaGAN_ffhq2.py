@@ -35,7 +35,7 @@ class SG2Generator(torch.nn.Module):
         self.map_layers  = map_layers
         self.img_size = img_size
         self.log_size = int(math.log(img_size, 2))
-        self.num_layers = (self.log_size - 2) * 2 + 1
+        self.num_layers = (self.log_size - 2) * 2 + 2
         self.device = device
         self.c_dim = c_dim
         
