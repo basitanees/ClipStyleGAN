@@ -12,6 +12,7 @@ from models.stylegan2.op import FusedLeakyReLU, fused_leaky_relu, upfirdn2d
 import torchvision
 toPIL = torchvision.transforms.ToPILImage()
 import numpy as np
+from torch.nn import Sigmoid
 
 class PixelNorm(nn.Module):
     def __init__(self):
@@ -133,13 +134,16 @@ class EqualConv2d(nn.Module):
 
 class EqualLinear(nn.Module):
     def __init__(
-        self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None
+        self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None, weight_tensor=None
     ):
         super().__init__()
         self.out_dim = out_dim
         self.in_dim = in_dim
         
-        self.weight = nn.Parameter(torch.randn(out_dim, in_dim).div_(lr_mul))
+        if weight_tensor is None:
+            self.weight = nn.Parameter(torch.randn(out_dim, in_dim).div_(lr_mul))
+        else:
+            self.weight = nn.Parameter(weight_tensor.div_(lr_mul))
 
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_dim).fill_(bias_init))
@@ -163,11 +167,19 @@ class EqualLinear(nn.Module):
             )
 
         return out
+    
+    def forward_dot(self, input):
+        input_norm = input / input.clone().norm(dim=-1, keepdim=True)
+        weight_norm = self.weight / self.weight.clone().norm(dim=-1, keepdim=True)
+        scale = torch.acos(F.cosine_similarity(input_norm, weight_norm)[:,None]) / (torch.acos(torch.zeros(1)).item() * 2)
+        return scale
+        # return input * scale
 
     def __repr__(self):
         return (
             f'{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]})'
         )
+
 
 
 class ScaledLeakyReLU(nn.Module):
@@ -191,7 +203,9 @@ class HyperNet(nn.Module):
         kernel_size,
         no_scaling=False, 
         no_residual=False,
-        device = "cuda"
+        # scaling_
+        device = "cuda",
+        scaled = None
     ):
         super().__init__()
         self.style_dim = style_dim
@@ -201,6 +215,20 @@ class HyperNet(nn.Module):
         
         self.no_scaling = no_scaling
         self.no_residual= no_residual
+        self.device = device
+        
+        self.scaled = scaled
+        self.sigmoid = Sigmoid()
+        if self.scaled is not None:
+            weight_tensor = torch.from_numpy(np.load("/kuacc/users/aanees20/hpc_run/DynaGAN/mean_embed.npy")).type(torch.FloatTensor) # clip embedding of mean image
+            if self.scaled["type"] == "linear":
+                self.dom_scale = EqualLinear(self.style_dim, 1, bias_init=0, weight_tensor=weight_tensor).to(device)
+            elif self.scaled["type"] == "dot":
+                self.dom_scale = EqualLinear(self.style_dim, 1, bias=False, weight_tensor=weight_tensor).to(device)
+                # self.dom_scale = nn.Parameter(torch.randn(1, self.style_dim)).to(device)
+                # self.cos_sim = torch.nn.CosineSimilarity()
+            else:
+                print("selected scaling {} not defined". format(self.scaled["type"]))
         
         if not no_residual: 
             self.out_channel_estimator = EqualLinear(self.style_dim, self.out_channel, bias_init=1).to(device)
@@ -216,9 +244,16 @@ class HyperNet(nn.Module):
             self.domain_modulation = EqualLinear(self.style_dim, self.out_channel, bias_init=1).to(device)
             self.domain_modulation.weight.data = self.domain_modulation.weight.data * 0.01
 
-    def forward(self, domain_style, weight_central=None):
-        batch = len(domain_style)
+    def forward(self, domain_style_vec, weight_central=None):
+        batch = len(domain_style_vec)
         
+        domain_style = domain_style_vec
+        feature_scale = torch.tensor(1.0).view(-1,1).to(self.device)
+        if self.scaled is not None:
+            if self.scaled["type"] == "linear":
+                feature_scale = self.sigmoid(self.dom_scale(domain_style_vec))
+            elif self.scaled["type"] == "dot":
+                feature_scale = self.dom_scale.forward_dot(domain_style_vec)
         
         if not self.no_residual:
             res_out_channel = self.out_channel_estimator(domain_style)
@@ -236,7 +271,7 @@ class HyperNet(nn.Module):
         else:
             domain_mod = 1.
             
-        return res_conv, domain_mod
+        return res_conv, domain_mod, feature_scale
 
 
 class ModulatedConv2d(nn.Module):
@@ -291,7 +326,6 @@ class ModulatedConv2d(nn.Module):
 
         self.domain_mod = None
         self.res_weight = None
-        
 
     def __repr__(self):
         return (
@@ -302,90 +336,22 @@ class ModulatedConv2d(nn.Module):
     def _convert_scale(self, alpha, domain_mod):
         return alpha*(domain_mod-1.0)+1.0        
 
-    # def forward(self, input, style, domain_style=None, alpha=1.0, beta=1.0):
-    #     batch, in_channel, height, width = input.shape
-
-    #     if domain_style is not None:
-    #         res_weight, domain_mod = self.hypernet(domain_style)
-                        
-    #         res_weight = beta * res_weight
-    #         domain_mod = self._convert_scale(alpha, domain_mod)
-            
-    #     else:
-    #         res_weight, domain_mod = 0.0, 1.0
-            
-    #     style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
-    #     weight = self.scale * (self.weight+res_weight) * style
-
-    #     if self.demodulate:
-    #         demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
-    #         weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
-
-    #     weight = weight * domain_mod
-
-    #     weight = weight.view(
-    #         batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size
-    #     )
-
-
-    #     if self.upsample:
-    #         input = input.view(1, batch * in_channel, height, width)
-    #         weight = weight.view(
-    #             batch, self.out_channel, in_channel, self.kernel_size, self.kernel_size
-    #         )
-    #         weight = weight.transpose(1, 2).reshape(
-    #             batch * in_channel, self.out_channel, self.kernel_size, self.kernel_size
-    #         )
-    #         out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
-    #         _, _, height, width = out.shape
-    #         out = out.view(batch, self.out_channel, height, width)
-    #         out = self.blur(out)
-
-    #     elif self.downsample:
-    #         input = self.blur(input)
-    #         _, _, height, width = input.shape
-    #         input = input.view(1, batch * in_channel, height, width)
-    #         out = F.conv2d(input, weight, padding=0, stride=2, groups=batch)
-    #         _, _, height, width = out.shape
-    #         out = out.view(batch, self.out_channel, height, width)
-
-    #     else:
-    #         input = input.view(1, batch * in_channel, height, width)
-    #         out = F.conv2d(input, weight, padding=self.padding, groups=batch)
-    #         _, _, height, width = out.shape
-    #         out = out.view(batch, self.out_channel, height, width)
-
-    #     return out
 
     def forward(self, input, style, domain_style=None, alpha=1.0, beta=1.0):
         batch, in_channel, height, width = input.shape
 
-        # if domain_style is not None:
-        #     res_weight, domain_mod = self.hypernet(domain_style)
-                        
-        #     res_weight = beta * res_weight
-        #     domain_mod = self._convert_scale(alpha, domain_mod)
-            
-        # else:
-        #     res_weight, domain_mod = 0.0, 1.0
         if domain_style is not None:
-            if not isinstance(domain_style, list):
-                domain_style = [domain_style]
-            residual_feats = 0
-            for dom_style in domain_style:
-                residual_feat = self.forward_residual(input, style, domain_style=dom_style, alpha=alpha, beta=beta)
-                residual_feats += residual_feat
-            residual_feats = residual_feats / len(domain_style)
-        
+            residual_feat = self.forward_residual(input, style, domain_style=domain_style, alpha=alpha, beta=beta)
+        res_weight, domain_mod = 0.0, 1.0
+            
         style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
-        weight = self.scale * (self.weight) * style ######
-        # weight = self.scale * (self.weight+res_weight) * style ######
+        weight = self.scale * (self.weight+res_weight) * style
 
         if self.demodulate:
             demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
             weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
 
-        # weight = weight * domain_mod ######
+        weight = weight * domain_mod
 
         weight = weight.view(
             batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size
@@ -420,16 +386,16 @@ class ModulatedConv2d(nn.Module):
             out = out.view(batch, self.out_channel, height, width)
         
         if domain_style is not None:
-            out = out + self.residual_multiplier * residual_feats
+            out = out + 0.1 * residual_feat
 
         return out
-    
+
     def forward_residual(self, input, style, domain_style=None, alpha=1.0, beta=1.0):
         batch, in_channel, height, width = input.shape
 
         if domain_style is not None:
-            res_weight, domain_mod = self.hypernet(domain_style, weight_central=self.weight)
-                        
+            res_weight, domain_mod, feature_scale = self.hypernet(domain_style)
+            
             res_weight = beta * res_weight
             domain_mod = self._convert_scale(alpha, domain_mod)
             
@@ -476,12 +442,13 @@ class ModulatedConv2d(nn.Module):
             out = F.conv2d(input, weight, padding=self.padding, groups=batch)
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
+        
+        return out * feature_scale[:,None,None] ###########
 
-        return out
-
-    def create_domain_modulation(self, no_scaling=False, no_residual=False):
-        self.residual_multiplier = 0.1#nn.Parameter(torch.tensor(0.0001))
-        self.hypernet = HyperNet(self.style_dim, self.out_channel, self.in_channel, self.kernel_size, no_scaling=no_scaling, no_residual=no_residual)
+    def create_domain_modulation(self, no_scaling=False, no_residual=False, scaled=None):
+        
+        # self.residual_multiplier = nn.Parameter(torch.tensor(-2.0)) # 2.0
+        self.hypernet = HyperNet(self.style_dim, self.out_channel, self.in_channel, self.kernel_size, no_scaling=no_scaling, no_residual=no_residual, scaled=scaled)
                
             
 class NoiseInjection(nn.Module):
@@ -547,8 +514,8 @@ class StyledConv(nn.Module):
 
         return out
 
-    def create_domain_modulation(self, no_scaling=False, no_residual=False):
-        self.conv.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual)
+    def create_domain_modulation(self, no_scaling=False, no_residual=False, scaled=None):
+        self.conv.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, scaled=scaled)
 
 class ToRGB(nn.Module):
     def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=[1, 3, 3, 1]):
@@ -699,11 +666,11 @@ class Generator(nn.Module):
     def get_latent(self, input):
         return self.style(input)
 
-    def create_domain_modulation(self, no_scaling=False, no_residual=False, embed2embed=False):
+    def create_domain_modulation(self, no_scaling=False, no_residual=False, embed2embed=False, scaled=None):
         
-        self.conv1.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual)
+        self.conv1.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, scaled=scaled)
         for conv in self.convs:
-            conv.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual)
+            conv.create_domain_modulation(no_scaling=no_scaling, no_residual=no_residual, scaled=scaled)
         if not embed2embed:
             layers = [ EqualLinear(
                         self.c_dim, self.style_dim
