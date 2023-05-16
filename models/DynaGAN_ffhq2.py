@@ -4,7 +4,7 @@ import os
 import torch
 import numpy as np
 from tqdm.auto import tqdm
-from models.stylegan2.model_3 import Generator
+from models.stylegan2.model import Generator
 # from models.stylegan2.model_old import Generator
 # from models.e4e.e4e_models.encoders.psp_encoders import Encoder4Editing
 # from models.e4e.e4e_models.psp import get_keys
