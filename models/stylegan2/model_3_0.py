@@ -342,6 +342,10 @@ class ModulatedConv2d(nn.Module):
 
         if domain_style is not None:
             residual_feat = self.forward_residual(input, style, domain_style=domain_style, alpha=alpha, beta=beta)
+            
+        if self.res_alpha == 0:
+            return residual_feat
+        
         res_weight, domain_mod = 0.0, 1.0
             
         style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
